@@ -1,0 +1,33 @@
+name: CodeQL
+
+# Static analysis. Free and automatic on a public repo; on a *private* one it
+# needs GitHub Advanced Security turned on under Settings → Code security, and
+# without it every run fails on a permissions error.
+#
+# So the job is skipped outright while the repo is private, rather than left to
+# fail. A check that is permanently red teaches everyone to ignore red, which
+# is the last thing a repo whose whole point is a pass/fail scorecard can
+# afford. Make the repo public — which is also what lets outside candidates
+# fork it — and this starts running on its own with no edit here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+
+jobs:
+  analyze:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v3

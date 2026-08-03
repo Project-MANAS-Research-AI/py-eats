@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# What a run writes. The ground truth these are compared against is committed
+# under docs/assets/, so a candidate's own training run and their own rendered
+# GIF never overwrite the thing they are supposed to be reading.
+/trained_policy.pt
+/training_curve.png
+*.gif
+!docs/assets/*.gif
+
+# Maintainer-only: reference fixes and the checks that validate them against
+# solutions the grader's author did not write. Never published.
+reference_solutions/

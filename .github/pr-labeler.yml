@@ -1,0 +1,53 @@
+# Config for actions/labeler — auto-labels PRs based on which files changed.
+# Docs: https://github.com/actions/labeler
+#
+# Every glob here points at a file that actually exists in this repo. A path
+# copied from a different project matches nothing and the label silently never
+# applies, which is worse than having no labeler at all.
+
+"env/rules":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/snake_rl/env.py"
+
+"policy":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/snake_rl/models.py"
+
+"training":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/snake_rl/train.py"
+
+"viewer":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/snake_rl/viewer.py"
+
+"benchmark":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/snake_rl/benchmark.py"
+
+"tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "tests/**"
+
+"docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+
+"dependencies":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "pyproject.toml"
+          - "uv.lock"
+          - ".python-version"
+
+"ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"

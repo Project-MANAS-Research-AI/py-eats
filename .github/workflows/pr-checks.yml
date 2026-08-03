@@ -1,0 +1,353 @@
+name: Submission checks
+
+# THE grading path. A candidate forks the repo, does the work on their fork,
+# and opens a pull request here with everything they fixed; this is what reads
+# it. Dependabot bumps and maintainer work come through the same door and get
+# the same treatment.
+#
+# The one rule: the code is the PR's, the tests are this repo's. The whole
+# `tests/` directory is thrown away and restored from the `tests` branch before
+# anything runs, so a submission cannot change what grades it.
+#
+# The steps are ordered cheapest-first, and the first two are the ones that
+# decide whether a human ever sees this PR at all:
+#
+#   1. does it parse?              -- ruff, five seconds
+#   2. does the project still run? -- the guard-rail suite
+#
+# A PR that fails either is not a submission with a low score, it is a branch
+# that does not work. `pr-triage.yml` reads the verdict this job writes and
+# closes those, so they never reach the review queue. Everything after step 2
+# is scoring, and a low score is a perfectly good reason to still be reviewed.
+#
+# `pr-policy.yml` is what stops a PR deleting this file to avoid being graded:
+# it runs on `pull_request_target`, so it cannot be switched off from a branch.
+#
+# Note for fork PRs: GitHub holds workflow runs from first-time contributors
+# until a maintainer clicks "Approve and run". Every candidate is a first-time
+# contributor, so every first submission needs that click before any of this
+# happens.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# The graded suite trains a policy several times, so a re-push should cancel
+# the run it supersedes rather than queue behind it.
+concurrency:
+  group: grade-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  grade:
+    name: Does it run, and what does it fix?
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the PR
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Restore the official tests over whatever the PR ships
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # The `tests` branch, not the base branch. The base branch carries
+          # only the guard rails; the graded suite lives on `tests`.
+          git fetch origin tests "$BASE_REF"
+          rm -rf tests
+          git checkout origin/tests -- tests .github/scripts
+          # pyproject.toml decides where pytest looks and what the markers
+          # mean, so it is restored too -- from the base branch, which is the
+          # environment everyone is measured in.
+          git checkout "origin/$BASE_REF" -- pyproject.toml uv.lock .python-version
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.11'
+          enable-cache: true
+
+      # The full environment. Unlike the sibling toy-quadruped challenge this
+      # one cannot run lean: issue #1 is graded off a rendered board and issue #3
+      # by actually training, so torch and matplotlib are load-bearing here.
+      - name: Install project
+        run: uv sync --locked
+
+      # --- 1. does it parse? ----------------------------------------------
+      # The cheapest possible signal and the one worth seeing first: if the
+      # branch has a syntax error or references names that do not exist,
+      # nothing below it means anything.
+      - name: Does it even parse?
+        id: syntax
+        continue-on-error: true
+        run: uv run ruff check --select E9,F63,F7,F82 --output-format github .
+
+      # Style is worth seeing and not worth failing a first-year's submission
+      # over.
+      - name: Style
+        continue-on-error: true
+        run: uv run ruff check --output-format github .
+
+      # --- 2. does the project still work? --------------------------------
+      # Required -- a PR must not break the project -- but not fatal *here*.
+      # Aborting mid-job would skip the scorecard, and a PR that broke the
+      # environment is precisely when you want to see how far the damage went.
+      # The verdict step at the end is what enforces it.
+      - name: Guard rails
+        id: contract
+        continue-on-error: true
+        run: uv run pytest -m "not challenge" -q
+
+      # --- 3. is there a real change? --------------------------------------
+      - name: A real change was made
+        id: real
+        continue-on-error: true
+        env:
+          # base.sha comes straight from the event, so this never depends on a
+          # remote-tracking ref existing in the checkout.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          from=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
+
+          # Ignoring whitespace, blank lines and comment-only lines, so that
+          # reformatting or adding a docstring is not mistaken for work.
+          changed=$(git diff -w --ignore-blank-lines "$from" "$HEAD_SHA" \
+                    -- src/snake_rl/ | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' || true)
+          lines=$(printf '%s\n' "$changed" \
+                  | sed -E 's/^[+-][[:space:]]*//' \
+                  | grep -vE '^(#|$)' | grep -c . || true)
+
+          echo "meaningful changed lines under src/snake_rl/: $lines"
+          if [ "$lines" -eq 0 ]; then
+            {
+              echo "### Nothing to review"
+              echo ""
+              echo "This pull request changes no code under \`src/snake_rl/\`."
+              echo "Whitespace, comments and docstrings do not count. The work"
+              echo "goes in the environment, the policy, the training loop or"
+              echo "the viewer."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::No meaningful change under src/snake_rl/."
+            exit 1
+          fi
+
+      # If the overlay silently pulled the wrong branch, `pytest -m challenge`
+      # collects nothing, exits 5, and continue-on-error hides it -- the run
+      # goes green having graded nothing. Fail loudly instead. Folded into the
+      # verdict below rather than exiting here, because "no result at all" is
+      # the least useful thing a grading run can produce.
+      - name: Confirm the graded suite is present
+        id: collected
+        continue-on-error: true
+        run: |
+          count=$(uv run pytest -m challenge --collect-only -q 2>/dev/null | grep -c '::' || true)
+          echo "collected $count challenge tests"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No challenge tests collected - the tests overlay failed."
+            exit 1
+          fi
+
+      # --- 4. what does it actually fix? -----------------------------------
+      # A PR normally solves one issue and leaves the rest failing, so this
+      # step cannot gate on its own exit code. The comparison below does.
+      - name: Challenge issues
+        continue-on-error: true
+        env:
+          CHALLENGE_SCORECARD_JSON: ${{ runner.temp }}/head.json
+        run: uv run pytest -m challenge -q
+
+      # Grade the branch this PR targets, with the same tests, so the result
+      # can be read as a change rather than an absolute.
+      - name: Grade the base branch for comparison
+        continue-on-error: true
+        env:
+          CHALLENGE_SCORECARD_JSON: ${{ runner.temp }}/base.json
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git checkout "origin/$BASE_REF" -- src/snake_rl
+          uv run pytest -m challenge -q
+
+      - name: Put the PR's own code back
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git checkout "$HEAD_SHA" -- src/snake_rl
+
+      # Who has to move an issue to pass. A docs or CI pull request touches no
+      # graded code and is judged on nothing here; one that rewrites the
+      # environment, the trainer or the viewer is claiming to fix something and
+      # is held to it.
+      - name: Does this PR touch graded code?
+        id: kind
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ACTOR: ${{ github.event.pull_request.user.login }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+
+          # Read from git, not the labels API: `pr-policy.yml` attaches the
+          # `submission` label while this job is already running, so the event
+          # payload can predate it and the check would race.
+          graded='^src/snake_rl/(env|models|train|viewer)\.py$'
+          changed=$(git diff --name-only "origin/$BASE_REF...$HEAD_SHA" || true)
+          touched=$(printf '%s\n' "$changed" | grep -E "$graded" || true)
+
+          must_fix=true
+          [ -n "$touched" ] || must_fix=false
+          # Same two exemptions pr-policy.yml uses, for the same reason.
+          case "$ACTOR" in
+            dependabot|'dependabot[bot]') must_fix=false ;;
+          esac
+          case ",$LABELS," in
+            *,ci-change,*) must_fix=false ;;
+          esac
+
+          # What the reviewer wants to know at a glance: did this submission
+          # touch the environment, the policy code, and the write-up.
+          has() { printf '%s\n' "$changed" | grep -qE "$1"; }
+          has '^src/snake_rl/env\.py$'            && env_touched=yes  || env_touched=no
+          has '^src/snake_rl/(models|train)\.py$' && policy_touched=yes || policy_touched=no
+          has '^README\.md$'                      && readme_touched=yes || readme_touched=no
+
+          {
+            echo "must_fix=$must_fix"
+            echo "env_touched=$env_touched"
+            echo "policy_touched=$policy_touched"
+            echo "readme_touched=$readme_touched"
+          } >> "$GITHUB_OUTPUT"
+          echo "graded code touched: ${touched:-none}; must fix an issue: $must_fix"
+
+      # The point of the whole job, in two halves. A pull request may never
+      # un-solve something. And one that rewrites graded code has to move at
+      # least one issue forward -- without that, editing the environment at
+      # random is indistinguishable from doing the work.
+      - name: Every PR must move an issue, and none may regress
+        id: regress
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          MUST_FIX: ${{ steps.kind.outputs.must_fix }}
+        run: uv run python .github/scripts/compare_scorecards.py
+             "${{ runner.temp }}/base.json" "${{ runner.temp }}/head.json"
+
+      # --- 5. something the reviewer can actually watch --------------------
+      # Skipped when the branch does not parse or does not hold together --
+      # rendering a GIF from code that is already known broken buys nothing
+      # and costs a minute.
+      - name: Render the board
+        id: render
+        if: steps.syntax.outcome == 'success' && steps.contract.outcome == 'success'
+        continue-on-error: true
+        env:
+          MPLBACKEND: Agg
+        run: |
+          set -euo pipefail
+          uv run py-eats-view --seed 74 --save head_marker.gif
+          uv run py-eats-view --checkpoint docs/assets/trained_policy.pt \
+                              --seed 85 --save trained.gif
+          for gif in head_marker.gif trained.gif; do
+            test -s "$gif"
+            size=$(wc -c < "$gif")
+            echo "$gif: $size bytes"
+            # A viewer that rendered nothing still writes a valid GIF header.
+            # Anything real is hundreds of kilobytes.
+            if [ "$size" -lt 10000 ]; then
+              echo "::error::$gif is $size bytes - the viewer produced an empty animation."
+              exit 1
+            fi
+          done
+
+      # Worth more than any of the text above: the reviewer can watch it. The
+      # committed originals go up alongside so the two can be opened side by
+      # side without leaving the run.
+      - name: Attach the animations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: submission-${{ github.event.pull_request.number }}
+          path: |
+            head_marker.gif
+            trained.gif
+            docs/assets/head_marker.gif
+            docs/assets/trained_policy.gif
+          if-no-files-found: ignore
+
+      # --- 6. the verdict --------------------------------------------------
+      # One file, read by `pr-triage.yml`, which has the write permissions
+      # this job deliberately does not. Nothing here decides anything new; it
+      # only records what the steps above found.
+      #
+      # `broken` is the distinction that matters: a branch that does not parse
+      # or does not hold the project together is not a low-scoring submission,
+      # it is a branch that does not work, and triage closes those rather than
+      # queueing them for review.
+      - name: Write the verdict
+        if: always()
+        env:
+          SYNTAX: ${{ steps.syntax.outcome }}
+          CONTRACT: ${{ steps.contract.outcome }}
+          REAL: ${{ steps.real.outcome }}
+          COLLECTED: ${{ steps.collected.outcome }}
+          REGRESS: ${{ steps.regress.outcome }}
+          RENDER: ${{ steps.render.outcome }}
+          ENV_TOUCHED: ${{ steps.kind.outputs.env_touched }}
+          POLICY_TOUCHED: ${{ steps.kind.outputs.policy_touched }}
+          README_TOUCHED: ${{ steps.kind.outputs.readme_touched }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          broken=none
+          if [ "$SYNTAX" = "failure" ]; then
+            broken=syntax
+          elif [ "$CONTRACT" = "failure" ]; then
+            broken=project
+          fi
+          cat > verdict.json <<JSON
+          {
+            "pr": "$NUMBER",
+            "head_sha": "$HEAD_SHA",
+            "broken": "$broken",
+            "syntax": "$SYNTAX",
+            "contract": "$CONTRACT",
+            "real_change": "$REAL",
+            "collected": "$COLLECTED",
+            "regression": "$REGRESS",
+            "render": "$RENDER",
+            "env_touched": "${ENV_TOUCHED:-no}",
+            "policy_touched": "${POLICY_TOUCHED:-no}",
+            "readme_touched": "${README_TOUCHED:-no}"
+          }
+          JSON
+          cat verdict.json
+          cp "${{ runner.temp }}/head.json" scorecard.json 2>/dev/null || echo '{}' > scorecard.json
+
+      - name: Attach the verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verdict-${{ github.event.pull_request.number }}
+          path: |
+            verdict.json
+            scorecard.json
+          if-no-files-found: warn
+
+      # One gate, at the end, so every report above has already been written.
+      - name: Fail the run if anything did not pass
+        if: |
+          steps.syntax.outcome == 'failure'
+          || steps.contract.outcome == 'failure'
+          || steps.real.outcome == 'failure'
+          || steps.collected.outcome == 'failure'
+          || steps.regress.outcome == 'failure'
+          || steps.render.outcome == 'failure'
+        run: exit 1

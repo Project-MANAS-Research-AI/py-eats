@@ -1,0 +1,146 @@
+name: Grade a fork
+
+# Run this from the Actions tab when someone shares their fork without opening
+# a pull request. It never runs the fork's copy of the tests: the project code
+# comes from the fork, the tests come from this repo, so a submission cannot
+# change what grades it.
+#
+# The pull-request path (`pr-checks.yml` plus `pr-triage.yml`) is the normal
+# one and does more -- it compares against the base branch and routes the
+# result. This is the manual door.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork:
+        description: 'Fork to grade, as owner/repo (e.g. student/py-eats)'
+        required: true
+      ref:
+        description: 'Branch or commit in that fork (blank = its default branch)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  grade:
+    name: ${{ inputs.fork }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the grading tests
+        uses: actions/checkout@v4
+        with:
+          # The `tests` branch, not the default one. The challenge tests and
+          # the scorecard live only there -- candidates get the guard rails on
+          # main and nothing else.
+          ref: tests
+          path: grader
+
+      - name: Check out the submitted fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.fork }}
+          ref: ${{ inputs.ref }}
+          path: submission
+          # Forks of a private repo are readable with a PAT from someone who
+          # can already see the parent. Falls back to the job token, which is
+          # enough when the fork is public.
+          token: ${{ secrets.GRADER_TOKEN || github.token }}
+
+      - name: Record what was graded
+        working-directory: submission
+        run: |
+          {
+            echo "### Graded \`${{ inputs.fork }}\`"
+            echo ""
+            echo "- ref: \`$(git rev-parse --abbrev-ref HEAD)\` at \`$(git rev-parse --short HEAD)\`"
+            echo "- committed: $(git log -1 --format=%cI)"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Overlay the official tests and the official environment
+        run: |
+          set -euo pipefail
+          rm -rf submission/tests
+          cp -r grader/tests submission/tests
+          mkdir -p submission/.github
+          cp -r grader/.github/scripts submission/.github/scripts
+          # What the checks run on is not something a submission gets a say in.
+          cp grader/pyproject.toml grader/uv.lock grader/.python-version submission/
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.11'
+          enable-cache: true
+
+      - name: Install project
+        working-directory: submission
+        run: uv sync --locked
+
+      # Cheapest possible signal, and the one worth seeing first: if the fork
+      # does not parse or imports names that do not exist, nothing below this
+      # means anything.
+      - name: Does it even run?
+        id: syntax
+        continue-on-error: true
+        working-directory: submission
+        run: uv run ruff check --select E9,F63,F7,F82 --output-format github .
+
+      - name: Note code that does not parse
+        if: steps.syntax.outcome == 'failure'
+        run: |
+          {
+            echo "> **This fork has syntax or undefined-name errors.** Everything"
+            echo "> below is unreliable until those are fixed."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guard rails — did the fork keep a working project?
+        id: contract
+        continue-on-error: true
+        working-directory: submission
+        run: uv run pytest -m "not challenge" -q
+
+      - name: Note a broken project
+        if: steps.contract.outcome == 'failure'
+        run: |
+          {
+            echo "> **The guard-rail suite failed.** This fork changed the"
+            echo "> project in a way that breaks its own contract, so the"
+            echo "> scorecard below does not mean much on its own."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # If the overlay silently pulled the wrong branch, `pytest -m challenge`
+      # collects nothing, exits 5, and continue-on-error hides it -- the run
+      # goes green having graded nothing. Fail loudly instead, but at the end,
+      # because "no result at all" is the least useful thing a grading run can
+      # produce.
+      - name: Confirm the graded suite is present
+        id: collected
+        continue-on-error: true
+        working-directory: submission
+        run: |
+          count=$(uv run pytest -m challenge --collect-only -q 2>/dev/null | grep -c '::' || true)
+          echo "collected $count challenge tests"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No challenge tests collected - the tests overlay failed."
+            exit 1
+          fi
+
+      # Always runs, so a fork that trips a guard rail still gets a scorecard.
+      - name: Challenge issues
+        id: challenge
+        continue-on-error: true
+        working-directory: submission
+        run: uv run pytest -m challenge -q
+
+      - name: Fail the run if anything did not pass
+        if: |
+          steps.syntax.outcome == 'failure'
+          || steps.contract.outcome == 'failure'
+          || steps.collected.outcome == 'failure'
+          || steps.challenge.outcome == 'failure'
+        run: exit 1

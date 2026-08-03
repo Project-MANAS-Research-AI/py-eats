@@ -1,0 +1,276 @@
+name: PR triage
+
+# Turns the verdict `pr-checks.yml` wrote into the one decision a maintainer
+# actually cares about: **is this worth my time?**
+#
+#   branch does not parse          -> commented on and closed
+#   project no longer holds        -> commented on and closed
+#   anything else                  -> labelled `ready-for-review`, assigned,
+#                                     and left for a human
+#
+# The second category is the important one. A submission that solves one issue
+# of three, or none, is still honest work and still reaches a reviewer; only a
+# branch that does not *run* is turned away, and even then it is turned away
+# with a comment saying exactly what broke and an invitation to reopen.
+#
+# Why `workflow_run` rather than doing this inside `pr-checks.yml`: a
+# `pull_request` run from a fork gets a read-only token and cannot label,
+# comment or close anything. `workflow_run` runs in the base repo's context
+# with the permissions below.
+#
+# SECURITY: like `pr-policy.yml`, this job never checks out or executes the
+# PR's code. It downloads one small JSON artifact written by the earlier run
+# and every value it reads out of it is quoted into a shell variable, never
+# evaluated.
+#
+# The artifact is *not* trusted to say which pull request it describes. A
+# `pull_request` run uses the workflow files from the PR's own branch, so a
+# submission can rewrite `pr-checks.yml` and upload a verdict naming any PR
+# number it likes -- and this job has `pull-requests: write`. Left alone that
+# is a way to close somebody else's submission. So the number is resolved from
+# `workflow_run.head_sha`, which comes from GitHub rather than the artifact,
+# and the artifact must agree about the commit before anything acts on it.
+
+on:
+  workflow_run:
+    workflows: ["Submission checks"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: read
+
+jobs:
+  triage:
+    name: Route the submission
+    runs-on: ubuntu-latest
+    # A cancelled run (a re-push superseding it) has nothing to say.
+    if: github.event.workflow_run.event == 'pull_request'
+        && github.event.workflow_run.conclusion != 'cancelled'
+    steps:
+      - name: Fetch the verdict
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p verdict && cd verdict
+          name=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+                 --jq '.artifacts[] | select(.name | startswith("verdict-")) | .name' \
+                 | head -1)
+          if [ -z "$name" ]; then
+            # The run died before it could write one -- infrastructure, a
+            # cancelled job, a timeout. Not something to close a PR over.
+            echo "no verdict artifact; nothing to triage"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh run download "$RUN_ID" -R "$REPO" -n "$name" -D .
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          cat verdict.json
+
+      - name: Read it
+        id: verdict
+        if: steps.fetch.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          cd verdict
+          # jq -r on a fixed set of keys: nothing from the artifact is ever
+          # interpolated into a shell command or an expression. `pr` is read
+          # for the log only -- the number acted on comes from the step below,
+          # because this file is attacker-controlled on a fork PR.
+          for key in pr head_sha broken syntax contract real_change collected \
+                     regression render env_touched policy_touched readme_touched; do
+            value=$(jq -r --arg k "$key" '.[$k] // "unknown"' verdict.json)
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+          done
+          jq -r 'to_entries | map("| #\(.key) | \(.value.passed)/\(.value.total) checks |")
+                 | join("\n")' scorecard.json > scorecard.md 2>/dev/null || : > scorecard.md
+          cat scorecard.md
+
+      # Which pull request this actually is, according to GitHub rather than
+      # according to the submission. `workflow_run.head_sha` is set by the
+      # event; the PR is looked up from it. Two things have to line up before
+      # anything below runs: a PR must exist for that commit, and the artifact
+      # must name the same commit. A verdict that disagrees is either stale or
+      # forged, and neither is something to close a pull request over.
+      - name: Resolve the pull request from the run, not from the artifact
+        id: pr
+        if: steps.fetch.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          ARTIFACT_SHA: ${{ steps.verdict.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$ARTIFACT_SHA" != "$RUN_SHA" ]; then
+            echo "::warning::verdict is for $ARTIFACT_SHA but this run is $RUN_SHA; ignoring it"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh api "repos/$REPO/commits/$RUN_SHA/pulls" > pulls.json 2>/dev/null || echo '[]' > pulls.json
+          number=$(jq -r --arg sha "$RUN_SHA" \
+                     '[.[] | select(.head.sha == $sha)][0].number // empty' pulls.json)
+
+          # That endpoint is documented around commits that are in the base
+          # repository, and a fork's head is only there via `refs/pull/N/head`.
+          # Rather than depend on it, fall back to matching the head SHA across
+          # the open pull requests. Still GitHub's own answer to "whose commit
+          # is this" -- the artifact gets no say either way.
+          if [ -z "$number" ]; then
+            number=$(gh pr list -R "$REPO" --state open --limit 200 \
+                       --json number,headRefOid \
+                     | jq -r --arg sha "$RUN_SHA" \
+                         '[.[] | select(.headRefOid == $sha)][0].number // empty')
+          fi
+
+          if [ -z "$number" ]; then
+            echo "no open pull request found for $RUN_SHA; nothing to triage"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "resolved PR #$number for $RUN_SHA"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      # --- the branch does not run ----------------------------------------
+      - name: Close a branch that does not run
+        if: steps.pr.outputs.found == 'true'
+             && (steps.verdict.outputs.broken == 'syntax'
+                 || steps.verdict.outputs.broken == 'project')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ steps.pr.outputs.number }}
+          BROKEN: ${{ steps.verdict.outputs.broken }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          gh label create auto-rejected --color B60205 --force \
+            --description "Closed by the automation before review" \
+            -R "$REPO" >/dev/null 2>&1 || true
+          gh pr edit "$NUMBER" -R "$REPO" --add-label auto-rejected >/dev/null 2>&1 || true
+
+          {
+            echo "## This pull request was closed automatically"
+            echo ""
+            if [ "$BROKEN" = "syntax" ]; then
+              echo "**The code on this branch does not parse.** \`ruff\` found a"
+              echo "syntax error or a name that does not exist, which means"
+              echo "nothing on the branch can be run, let alone graded — every"
+              echo "test below it fails on import rather than on its own merits."
+              echo ""
+              echo "Run this before pushing and it will tell you the same thing"
+              echo "in about five seconds:"
+              echo ""
+              echo '```bash'
+              echo "uv run ruff check --select E9,F63,F7,F82 ."
+              echo '```'
+            else
+              echo "**The project no longer holds together on this branch.** The"
+              echo "guard-rail suite failed. Those are not the challenge — they"
+              echo "are the invariants every version of the game has to keep:"
+              echo "finite observations of the size it advertises, a real"
+              echo "termination flag, the same seed still producing the same"
+              echo "trajectory. A change that breaks one of those has broken the"
+              echo "environment rather than improved it, and every measurement"
+              echo "taken afterwards means nothing."
+              echo ""
+              echo "Run this before pushing:"
+              echo ""
+              echo '```bash'
+              echo "uv run pytest -m \"not challenge\" -q"
+              echo '```'
+            fi
+            echo ""
+            echo "The full log is here: $RUN_URL"
+            echo ""
+            echo "---"
+            echo ""
+            echo "**This is not a rejection of your work.** Nobody has looked at"
+            echo "it yet — it did not get that far. Fix the branch, push, and"
+            echo "press **Reopen**; everything runs again from the top. Solving"
+            echo "one issue out of three is a perfectly good pull request, and it"
+            echo "will reach a reviewer. A branch that does not run cannot."
+          } > comment.md
+          gh pr comment "$NUMBER" -R "$REPO" --body-file comment.md
+          gh pr close "$NUMBER" -R "$REPO"
+
+      # --- everything else reaches a human --------------------------------
+      - name: Send it to review
+        if: steps.pr.outputs.found == 'true'
+             && steps.verdict.outputs.broken == 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ steps.pr.outputs.number }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          ENV_TOUCHED: ${{ steps.verdict.outputs.env_touched }}
+          POLICY_TOUCHED: ${{ steps.verdict.outputs.policy_touched }}
+          README_TOUCHED: ${{ steps.verdict.outputs.readme_touched }}
+          REGRESSION: ${{ steps.verdict.outputs.regression }}
+          # Who gets the submission. Set the `MAINTAINER` repository variable
+          # to a GitHub username; unset, the PR is still labelled and the label
+          # is what the review queue filters on, so nothing is lost.
+          MAINTAINER: ${{ vars.MAINTAINER }}
+        run: |
+          set -euo pipefail
+          gh label create ready-for-review --color 0E8A16 --force \
+            --description "Runs, holds together, waiting on a human" \
+            -R "$REPO" >/dev/null 2>&1 || true
+          gh pr edit "$NUMBER" -R "$REPO" \
+            --add-label ready-for-review --remove-label auto-rejected \
+            >/dev/null 2>&1 || true
+
+          if [ -n "${MAINTAINER:-}" ]; then
+            gh pr edit "$NUMBER" -R "$REPO" --add-assignee "$MAINTAINER" >/dev/null 2>&1 || true
+            # Not every account can be requested as a reviewer on every repo
+            # (a fork PR from outside the org, for one), so this is allowed to
+            # fail quietly -- the assignee above is what actually routes it.
+            gh pr edit "$NUMBER" -R "$REPO" --add-reviewer "$MAINTAINER" >/dev/null 2>&1 || true
+          fi
+
+          tick() { [ "$1" = "yes" ] && echo "yes" || echo "no"; }
+          {
+            echo "### Ready for review"
+            echo ""
+            echo "This branch parses and the project still holds its contract,"
+            echo "so it is somebody's real attempt and a human should read it."
+            echo "**Nothing here says the issues were solved** — the per-issue"
+            echo "scorecard in the run does."
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| environment (\`env.py\`) changed | $(tick "$ENV_TOUCHED") |"
+            echo "| policy code (\`models.py\`, \`train.py\`) changed | $(tick "$POLICY_TOUCHED") |"
+            echo "| write-up (\`README.md\`) changed | $(tick "$README_TOUCHED") |"
+            echo "| checks overall | $CONCLUSION |"
+            echo ""
+            if [ "$README_TOUCHED" != "yes" ]; then
+              echo "> The write-up in \`README.md\` is missing. Several \"Done"
+              echo "> when\"s are read rather than tested, so the measurements"
+              echo "> only count if they are written down. Worth asking for"
+              echo "> before reviewing the diff."
+              echo ""
+            fi
+            if [ "$REGRESSION" = "failure" ]; then
+              echo "> The before/after comparison failed: this PR either"
+              echo "> un-solves something that passed on \`main\`, or rewrites"
+              echo "> graded code without moving any issue forward. The table in"
+              echo "> the run says which."
+              echo ""
+            fi
+            echo "Rendered board and the committed originals are attached to"
+            echo "[the run]($RUN_URL) as an artifact, so the submission can be"
+            echo "watched rather than read about."
+          } > comment.md
+          gh pr comment "$NUMBER" -R "$REPO" --body-file comment.md

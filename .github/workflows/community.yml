@@ -1,0 +1,26 @@
+name: Community
+
+on:
+  issues:
+    types: [opened, edited, milestoned]
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  # `contents: read` is load-bearing, not boilerplate: the action fetches
+  # `.github/labeler.yml` through the contents API, and without it the job
+  # dies on "403 Resource not accessible by integration" before it labels
+  # anything. The two write scopes alone are not enough.
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  labeler:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Labels
+        id: labeler
+        uses: jimschubert/labeler-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

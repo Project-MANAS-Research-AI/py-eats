@@ -1,0 +1,72 @@
+[project]
+name = "py-eats"
+version = "0.1.0"
+description = "Snake, learned with REINFORCE — the Project MANAS RL recruitment challenge"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = ["numpy>=1.23"]
+
+# `uv sync` installs all three groups, so one command gives you the whole
+# project. The groups exist so a check that only needs numpy can opt out with
+# `--no-default-groups --group dev`; unlike the sibling toy-quadruped
+# challenge, most of this repo's checks cannot -- issue 1 is graded off a
+# rendered board and issue 3 by actually training, so torch and matplotlib are
+# load-bearing for the graded suite rather than just for the demos.
+[dependency-groups]
+agent = ["torch>=2.0"]              # the policy network and the training loop
+viewer = ["matplotlib>=3.5"]        # the animated board and the training curve
+dev = ["pytest>=8.0", "ruff>=0.6"]  # the checks
+
+[tool.uv]
+default-groups = ["agent", "viewer", "dev"]
+
+# --- torch, without three gigabytes of CUDA ---------------------------------
+#
+# The default PyPI torch wheel for Linux bundles the whole CUDA stack. This
+# board is 12x12 and every check runs on a CPU-only GitHub runner, so that is
+# several gigabytes downloaded to be ignored.
+#
+# `explicit = true` means nothing is drawn from this index unless it is routed
+# here by name, so the CPU index cannot start shadowing other packages. The
+# marker keeps macOS on PyPI, where torch is already CPU-only and where this
+# index has no wheels to offer.
+#
+# This lives here rather than as an `--extra-index-url` line in a requirements
+# file on purpose: Dependabot reads that line, resolves torch to its local
+# version and pins `torch>=2.13.0+cpu`, which pip rejects outright.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[project.scripts]
+py-eats-train = "snake_rl.train:main"
+py-eats-view = "snake_rl.viewer:main"
+py-eats-bench = "snake_rl.benchmark:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/snake_rl"]
+
+# Kept here rather than in a separate pytest.ini, so there is one file to read
+# and one file for Dependabot to bump. No rootdir conftest.py is needed: the
+# package is installed by `uv sync`, so `import snake_rl` works without
+# anything putting the repo root on sys.path.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "challenge: verifies an open challenge issue; expected to fail until it is solved",
+    "issue(number): the challenge issue this test grades",
+]
+
+[tool.ruff]
+line-length = 100

@@ -1,0 +1,50 @@
+name: Tests
+
+# Syntax and the guard rails, on every push and every pull request. Answers
+# one thing: does the code parse, and is the environment still an environment.
+# Nothing here knows what the challenge issues ask for -- that is
+# `pr-checks.yml`, which grades against the suite on the `tests` branch.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.11'
+          enable-cache: true
+
+      # The whole environment. The sibling toy-quadruped challenge runs this
+      # job on numpy alone, because its contract suite never imports torch;
+      # this one's guard rails cover the trainer and the viewer as well, so
+      # torch and matplotlib are both needed. `--locked` refuses to run against
+      # a uv.lock that no longer matches pyproject.toml.
+      - name: Install project
+        run: uv sync --locked
+
+      # Real errors only -- bad syntax, undefined names. These fail.
+      - name: Errors
+        run: uv run ruff check --select E9,F63,F7,F82 --output-format github .
+
+      # Style is worth seeing and not worth failing a submission over.
+      - name: Style
+        continue-on-error: true
+        run: uv run ruff check --output-format github .
+
+      # Only the guard-rail suite. The challenge tests are meant to fail on the
+      # repository as shipped, so running them here would leave this repo
+      # permanently red for no reason.
+      - name: Guard rails
+        run: uv run pytest -m "not challenge" -q

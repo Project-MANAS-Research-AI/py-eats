@@ -1,0 +1,240 @@
+name: PR policy
+
+# The first gate, and the only one that reads nothing but filenames.
+#
+# Three holes this closes.
+#
+# 1. For a `pull_request` event GitHub runs the workflow files *from the pull
+#    request's own merge ref*. A PR that deletes `.github/workflows/pr-checks.yml`
+#    therefore deletes the check that would have graded it, and the PR goes
+#    green because nothing ran. `pull_request_target` runs the copy of this
+#    file that is on the base branch instead, so a PR cannot switch it off.
+#
+# 2. A PR that changes nothing at all also goes green, for the same reason a
+#    blank page passes a spell check.
+#
+# 3. A PR that deletes files is not a submission at all. Nothing in the three
+#    issues is solved by removing anything, so a deletion is either an
+#    accident or an attempt to make a failing check disappear. Either way it
+#    is closed here rather than left in the review queue.
+#
+# What "rejected" means here: the PR is labelled, told why in a comment, and
+# **closed**. Nothing rejected at this stage reaches a reviewer. Fixing the
+# branch and reopening re-runs everything -- see `docs/automation.md`.
+#
+# SECURITY: `pull_request_target` runs with a writable token in the context of
+# this repo. This job must never check out or execute the PR's code. It only
+# reads the list of changed filenames from the API, which is inert.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  # write to label, comment on and close a pull request that is out of
+  # bounds; still no checkout and no execution of anything the PR contains.
+  pull-requests: write
+  issues: write
+
+jobs:
+  guard:
+    name: Changed files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check what this PR touches
+        id: policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          ACTOR: ${{ github.event.pull_request.user.login }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+
+          # status is one of added/removed/modified/renamed/copied/changed.
+          gh api --paginate "repos/$REPO/pulls/$NUMBER/files" \
+            --jq '.[] | [.status, .filename] | @tsv' > files.tsv
+
+          count=$(wc -l < files.tsv)
+          {
+            echo "### PR policy"
+            echo ""
+            echo "$count file(s) changed by \`$ACTOR\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Dependabot's whole job is bumping pinned versions in exactly the
+          # files below, and a maintainer changing CI on purpose labels the
+          # PR. `dependabot[bot]` must be quoted: unquoted, the brackets are a
+          # glob character class and the pattern never matches the real login.
+          exempt=0
+          case "$ACTOR" in
+            dependabot|'dependabot[bot]') exempt=1 ;;
+          esac
+          case ",$LABELS," in
+            *,ci-change,*) exempt=1 ;;
+          esac
+
+          # Reasons accumulate rather than short-circuiting: someone who
+          # tripped three rules should be told all three at once instead of
+          # discovering them one push at a time.
+          : > reasons.md
+
+          # --- 1. an empty PR ------------------------------------------------
+          if [ "$count" -eq 0 ]; then
+            {
+              echo "**This pull request changes no files.**"
+              echo ""
+              echo "Every check below it would pass without proving anything,"
+              echo "so it is closed instead."
+              echo ""
+            } >> reasons.md
+          fi
+
+          # --- 2. files that decide its own grade ----------------------------
+          # Anything that can weaken a check, switch one off, redirect pytest
+          # away from the suite, or change the environment it all runs in.
+          # `docs/assets/` is on the list because it is the ground truth every
+          # issue is compared against -- editing the answer key is not a fix.
+          #
+          # `conftest.py` is here for a reason that is not obvious: restoring
+          # `tests/` is not enough on its own. pytest also loads a conftest
+          # from the rootdir, so a `conftest.py` committed at the top level is
+          # imported into the graded run and can patch the code under test
+          # before a single check executes -- without touching `tests/` at all.
+          # `sitecustomize.py` is the same trick one layer down, at interpreter
+          # start-up.
+          protected='^(\.github/|tests/|pyproject\.toml$|uv\.lock$|\.python-version$|\.gitignore$|docs/assets/|(.*/)?conftest\.py$|(.*/)?sitecustomize\.py$)'
+          touched_protected=$(cut -f2 files.tsv | grep -E "$protected" || true)
+          if [ -n "$touched_protected" ] && [ "$exempt" -eq 0 ]; then
+            {
+              echo "**This PR edits files that decide its own grade:**"
+              echo ""
+              echo '```'
+              echo "$touched_protected"
+              echo '```'
+              echo ""
+              echo "The checks, the test suite, the locked environment and the"
+              echo "committed ground truth are not part of the challenge. A"
+              echo "maintainer who means to change them labels the PR"
+              echo '`ci-change`; Dependabot is exempt automatically.'
+              echo ""
+            } >> reasons.md
+          elif [ -n "$touched_protected" ]; then
+            echo "Protected paths touched, allowed for \`$ACTOR\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # --- 3. the file issue #2 says not to touch -------------------------
+          # "Do not edit benchmark.py. The players are written correctly; what
+          # they are being handed is not." Rewriting the players until they
+          # cope with backwards sensors passes the symptom and leaves the bug,
+          # so this is called out on its own rather than buried in the list
+          # above -- the reason is specific and worth saying.
+          benchmark=$(cut -f2 files.tsv | grep -E '^src/snake_rl/benchmark\.py$' || true)
+          if [ -n "$benchmark" ] && [ "$exempt" -eq 0 ]; then
+            {
+              echo "**This PR edits \`src/snake_rl/benchmark.py\`.**"
+              echo ""
+              echo "Issue #2 says in so many words not to: the two hand-written"
+              echo "players are correct, and what they are being handed is not."
+              echo "Changing them until they cope with the sensors as they"
+              echo "arrive treats the symptom and leaves the bug in place."
+              echo ""
+            } >> reasons.md
+          fi
+
+          # --- 4. deleting files ---------------------------------------------
+          # Not just the project's own modules: *any* deletion. None of the
+          # three issues is solved by removing a file, so a deletion is either
+          # an accident -- a bad merge, a stray `git rm`, a branch cut from the
+          # wrong place -- or an attempt to make a failing check disappear by
+          # removing what it reads. Removing `env.py` in particular makes every
+          # test error out on import rather than fail, which reads very
+          # differently in a log.
+          deleted=$(awk -F'\t' '$1=="removed"{print $2}' files.tsv || true)
+          if [ -n "$deleted" ] && [ "$exempt" -eq 0 ]; then
+            {
+              echo "**This PR deletes files:**"
+              echo ""
+              echo '```'
+              echo "$deleted"
+              echo '```'
+              echo ""
+              echo "None of the three issues is solved by removing anything, so"
+              echo "a deletion is either an accident or an attempt to make a"
+              echo "failing check disappear. If your branch shows deletions you"
+              echo "did not intend, it was almost certainly cut from the wrong"
+              echo "place -- see \"Keeping your fork current\" in CONTRIBUTING.md."
+              echo ""
+            } >> reasons.md
+          fi
+
+          if [ -s reasons.md ]; then
+            cat reasons.md >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "reject=true"
+              echo "reasons<<REASONS_EOF"
+              cat reasons.md
+              echo "REASONS_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Nothing out of bounds." >> "$GITHUB_STEP_SUMMARY"
+            echo "reject=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "exempt=$exempt" >> "$GITHUB_OUTPUT"
+
+      # Closed, not just failed. A red tick still leaves the PR sitting in the
+      # review queue; the point of this gate is that what it catches never
+      # reaches a reviewer at all.
+      - name: Close a PR that is out of bounds
+        if: steps.policy.outputs.reject == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          REASONS: ${{ steps.policy.outputs.reasons }}
+        run: |
+          set -euo pipefail
+          gh label create auto-rejected --color B60205 --force \
+            --description "Closed by the automation before review" \
+            -R "$REPO" >/dev/null 2>&1 || true
+          gh pr edit "$NUMBER" -R "$REPO" --add-label auto-rejected >/dev/null 2>&1 || true
+
+          {
+            echo "## This pull request was closed automatically"
+            echo ""
+            echo "$REASONS"
+            echo "---"
+            echo ""
+            echo "**This is not a rejection of your work.** Nobody has looked at"
+            echo "it yet — it did not get that far. Put the branch back in bounds"
+            echo "and press **Reopen**, and every check runs again from the top."
+            echo ""
+            echo "\`CONTRIBUTING.md\` lists what a submission may and may not"
+            echo "touch, and \`docs/automation.md\` explains what each check does."
+          } > comment.md
+          gh pr comment "$NUMBER" -R "$REPO" --body-file comment.md
+          gh pr close "$NUMBER" -R "$REPO"
+          echo "::error::Closed: this pull request is out of bounds. See the comment on the PR."
+          exit 1
+
+      # Mark it as a submission. Anything that is not Dependabot and not a
+      # maintainer's deliberate CI change is somebody's challenge work.
+      # `stale.yml` exempts this label -- a submission sitting quiet for 60
+      # days is waiting on review, not abandoned.
+      - name: Label a submission
+        if: steps.policy.outputs.reject == 'false' && steps.policy.outputs.exempt == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh label create submission --color 1D76DB --force \
+            --description "A candidate's challenge submission" \
+            -R "$REPO" >/dev/null 2>&1 || true
+          gh pr edit "$NUMBER" -R "$REPO" --add-label submission >/dev/null 2>&1 || true
+          # A reopened PR that has since been fixed should not keep wearing the
+          # label from the run that closed it.
+          gh pr edit "$NUMBER" -R "$REPO" --remove-label auto-rejected >/dev/null 2>&1 || true

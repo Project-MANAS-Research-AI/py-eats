@@ -1,0 +1,26 @@
+name: Dependency Review
+
+# Flags dependencies with known vulnerabilities on incoming pull requests.
+#
+# Needs the dependency graph, which on a *private* repo means GitHub Advanced
+# Security; without it the action fails on every PR. Skipped while the repo is
+# private for the same reason codeql.yml is: a check that is permanently red
+# teaches everyone to ignore red, and this repo asks candidates to read a
+# scorecard rather than a tick. Make the repo public and it starts running on
+# its own.
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependency-review:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
